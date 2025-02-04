@@ -102,7 +102,7 @@ prepare_cgroup_filesystem() {
 # BEGIN: cleanup_cgroups function
 # Function to clean up container-specific cgroups.
 cleanup_cgroups() {
-    log "Cleaning up cgroups..."
+    log "Cleaning up container-specific cgroups..."
 
     # Remove container-specific cgroup directory if it exists
     if [ -d "$CONTAINER_CGROUP" ]; then
@@ -120,13 +120,34 @@ cleanup_cgroups() {
 # END: cleanup_cgroups function
 
 # -----------------------------------------------------------------------------
+# BEGIN: cleanup_legacy_cgroups function
+# Function to clean up any legacy cgroup v1 directories that might have been created.
+cleanup_legacy_cgroups() {
+    log "Cleaning up legacy cgroup v1 directories..."
+    # List of common legacy cgroup v1 controllers
+    local controllers=(cpuset cpu cpuacct memory devices freezer net_cls blkio)
+    for subsys in "${controllers[@]}"; do
+        if mountpoint -q "/sys/fs/cgroup/$subsys"; then
+            log "Unmounting legacy cgroup v1 controller: $subsys..."
+            sudo umount "/sys/fs/cgroup/$subsys" 2>/dev/null || true
+        fi
+        if [ -d "/sys/fs/cgroup/$subsys" ]; then
+            log "Removing legacy cgroup directory: /sys/fs/cgroup/$subsys..."
+            sudo rmdir "/sys/fs/cgroup/$subsys" 2>/dev/null || true
+        fi
+    done
+}
+# END: cleanup_legacy_cgroups function
+
+# -----------------------------------------------------------------------------
 # BEGIN: cleanup function
-# Modified cleanup function that calls cleanup_cgroups and performs additional cleanup.
+# Modified cleanup function that calls cleanup_cgroups, cleanup_legacy_cgroups, and performs additional cleanup.
 cleanup() {
     local exit_code=$?
     log "Performing cleanup..."
 
-    cleanup_cgroups  # Clean up cgroup resources
+    cleanup_cgroups       # Clean up container-specific cgroup resources
+    cleanup_legacy_cgroups  # Clean up any legacy cgroup v1 directories
 
     # Existing cleanup code:
     if sudo crun list | grep -qw "$IMAGE_ID"; then
