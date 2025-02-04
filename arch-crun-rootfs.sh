@@ -273,7 +273,7 @@ create_container_config() {
             "memory": {"limit": 512000000},
             "cpu": {"weight": 1024}
         },
-        "cgroupsPath": "/sys/fs/cgroup",  # Add this line to specify the cgroup path
+        "cgroupsPath": "/sys/fs/cgroup",
         "seccomp": {
             "defaultAction": "SCMP_ACT_ERRNO",
             "architectures": ["SCMP_ARCH_X86_64"],
