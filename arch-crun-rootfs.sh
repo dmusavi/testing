@@ -236,6 +236,7 @@ EOF
 }
 #End of crete nginx config function
 # Function to create container config
+# Function to create container config
 create_container_config() {
     if [ ! -d "$BUNDLE_DIR" ]; then
         log "Error: Directory $BUNDLE_DIR does not exist."
@@ -305,6 +306,7 @@ EOF
     sudo chmod 644 "$BUNDLE_DIR/config.json"
     log "Container config created."
 }
+#End of create container config function
 #End of create container config function
 #Function to create namesapces networking
 setup_networking() {
