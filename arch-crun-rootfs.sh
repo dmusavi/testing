@@ -368,11 +368,27 @@ prepare_cgroup_v2() {
         log "Mounting unified cgroup2 filesystem..."
         if sudo mount -t cgroup2 none /sys/fs/cgroup; then
             log "Successfully mounted cgroup2."
+            # Set correct permissions for cgroup2 directory
+            sudo chmod 755 /sys/fs/cgroup
+            # Ensure root has ownership
+            sudo chown root:root /sys/fs/cgroup
+            # Optionally, you might want to set specific permissions for subdirectories
+            sudo find /sys/fs/cgroup -type d -exec sudo chmod 755 {} \;
+            log "Permissions set for cgroup2."
         else
             error_exit "Failed to mount cgroup2. Check if cgroup2 support is enabled in your kernel."
         fi
     else
         log "cgroup2 is already mounted."
+        # Check and set permissions if they are not correct
+        if [ "$(stat -c %a /sys/fs/cgroup)" != "755" ] || [ "$(stat -c %U:%G /sys/fs/cgroup)" != "root:root" ]; then
+            sudo chmod 755 /sys/fs/cgroup
+            sudo chown root:root /sys/fs/cgroup
+            sudo find /sys/fs/cgroup -type d -exec sudo chmod 755 {} \;
+            log "Permissions adjusted for existing cgroup2 mount."
+        else
+            log "Permissions for cgroup2 are already correct."
+        fi
     fi
     log "Cgroup v2 preparation completed."
 }
