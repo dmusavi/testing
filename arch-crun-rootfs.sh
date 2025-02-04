@@ -1,10 +1,10 @@
-#End of variable
 #!/bin/bash
-
+# -----------------------------------------------------------------------------
 # Set strict error handling
 set -euo pipefail  # Exit immediately on error, treat unset variables as errors, and ensure correct handling of pipes
-IFS=$'\n\t'  # Set Internal Field Separator for handling newlines and tabs
+IFS=$'\n\t'       # Set Internal Field Separator for handling newlines and tabs
 
+# -----------------------------------------------------------------------------
 # Variables
 EXPECTED_CHECKSUM="SHA256_CHECKSUM_HERE"   # Expected SHA256 checksum for verification (replace with actual checksum)
 IMAGE_ID="arch-container"                  # Container ID for crun
@@ -16,9 +16,9 @@ HOST_PORT="8088"                           # Host port for container port forwar
 CONTAINER_PORT="80"                        # Container port
 
 BASE_DIR="$HOME/downloads/media/config/nginx"
-HOST_CONFIG_DIR="$BASE_DIR" # Directory for Nginx configuration on the host
+HOST_CONFIG_DIR="$BASE_DIR"                # Directory for Nginx configuration on the host
 HOST_NGINX_CONF="$HOST_CONFIG_DIR/nginx.conf"  # Path to Nginx configuration on the host
-HOST_MEDIA_DIR="$HOST_CONFIG_DIR/media"  # Directory for media files to be served by Nginx on the host
+HOST_MEDIA_DIR="$HOST_CONFIG_DIR/media"    # Directory for media files to be served by Nginx on the host
 
 # URLs for the bootstrap tarball, its signature, and the checksum file
 IMAGE_URL_ARCH="https://geo.mirror.pkgbuild.com/iso/2025.02.01/archlinux-bootstrap-2025.02.01-x86_64.tar.zst"
@@ -32,74 +32,213 @@ IMAGE_FILE="archlinux-bootstrap-2025.02.01-x86_64.tar.zst"
 DOWNLOAD_DIR="$BASE_DIR/downloads"
 BUNDLE_DIR="$BASE_DIR"
 
-# Setup logging
+# -----------------------------------------------------------------------------
+# BEGIN: log function
+# Function to log informational messages.
 log() {
-    echo -e "[INFO] $1" | logger -s -t "$(basename "$0")"  # Log informational messages with system logger
+    echo "[INFO] $1"
 }
+# END: log function
+
+# -----------------------------------------------------------------------------
+# BEGIN: error_exit function
+# Function to handle errors by printing a message and exiting.
 error_exit() {
-    echo -e "[ERROR] $1"  # Log error messages
-    cleanup  # Call cleanup function
-    exit 1  # Exit with a non-zero status
+    echo "[ERROR] $1" >&2
+    exit 1
 }
+# END: error_exit function
 
-# Log the start of the script
-log "Script started"
-#End of setup logging
-# Cleanup function
-cleanup() {
-    local exit_code=$?  # Capture the exit code
-    log "Performing cleanup..."
+# -----------------------------------------------------------------------------
+# BEGIN: pre_cleanup function
+# Function to clean up any leftovers from previous runs.
+pre_cleanup() {
+    log "Performing pre-cleanup of previous resources..."
 
-    # Stop and remove container
+    # Stop and remove the container if it exists.
     if sudo crun list | grep -qw "$IMAGE_ID"; then
-        sudo crun stop "$IMAGE_ID" 2>/dev/null || true  # Stop the container
-        sudo crun delete -f "$IMAGE_ID" 2>/dev/null || true  # Force delete the container
+        log "Stopping and deleting existing container $IMAGE_ID..."
+        sudo crun stop "$IMAGE_ID" 2>/dev/null || true
+        sudo crun delete -f "$IMAGE_ID" 2>/dev/null || true
     fi
 
-    # Clean up network namespace and interfaces
+    # Delete network namespace if it exists.
     if sudo ip netns list | grep -qw "$NETNS_NAME"; then
-        sudo ip netns del "$NETNS_NAME" 2>/dev/null || true  # Delete network namespace
+        log "Deleting existing network namespace $NETNS_NAME..."
+        sudo ip netns del "$NETNS_NAME" 2>/dev/null || true
     fi
 
-    # Remove veth pair if created by this script
+    # Delete veth pair if it exists.
     if ip link show veth1 &>/dev/null; then
-        sudo ip link delete veth1 2>/dev/null || true  # Delete veth pair
+        log "Deleting existing veth pair..."
+        sudo ip link delete veth1 2>/dev/null || true
     fi
 
-    # Remove temporary directories
-    sudo rm -rf "$DOWNLOAD_DIR" "$BUNDLE_DIR"
+    # Remove previous bundle and downloads directories.
+    if [ -d "$BUNDLE_DIR" ]; then
+        log "Removing previous bundle directory: $BUNDLE_DIR..."
+        sudo rm -rf "$BUNDLE_DIR"
+    fi
 
-    # Remove the PID file
-    rm -f "/tmp/container_$IMAGE_ID.pid"
+    if [ -d "$DOWNLOAD_DIR" ]; then
+        log "Removing previous downloads directory: $DOWNLOAD_DIR..."
+        sudo rm -rf "$DOWNLOAD_DIR"
+    fi
 
-    exit "$exit_code"  # Exit with the captured exit code
+    log "Pre-cleanup completed."
 }
-#End of cleanup function 
-# Set up trap for cleanup
-trap cleanup ERR EXIT  # Catch ERR and EXIT signals to execute cleanup function
+# END: pre_cleanup function
 
-# Function to check dependencies
-check_dependencies() {
-    local deps=(crun sudo wget mount)  # Using wget as per the script, mount is included for cgroup operations
-    for cmd in "${deps[@]}"; do
-        if ! command -v "$cmd" >/dev/null 2>&1; then
-            error_exit "$cmd is not installed. Please install it before running this script."  # Check if all dependencies are installed
+# -----------------------------------------------------------------------------
+# BEGIN: prepare_cgroup_filesystem function
+# Function to check and prepare the cgroup v2 filesystem.
+prepare_cgroup_filesystem() {
+    log "Preparing cgroup v2 filesystem..."
+
+    # Unmount any existing mount at /sys/fs/cgroup (up to 5 attempts)
+    for i in {1..5}; do
+        if mountpoint -q /sys/fs/cgroup; then
+            log "Unmounting existing cgroup mount (attempt $i)..."
+            sudo umount /sys/fs/cgroup || break
+        else
+            break
         fi
     done
 
-    # Check crun version
-    local crun_version
-    crun_version=$(crun --version | head -n1 | awk '{print $3}')  # Get crun version
-    if ! printf '%s\n%s\n' "1.0" "$crun_version" | sort -V -C; then  # Check if crun version is at least 1.0
-        error_exit "crun version must be at least 1.0"  # Exit if version is not valid
+    # Create mount point if not present and mount cgroup v2 using the proper source name "cgroup2"
+    if ! mountpoint -q /sys/fs/cgroup; then
+        log "Creating cgroup mount point..."
+        sudo mkdir -p /sys/fs/cgroup
+        log "Mounting cgroup v2 filesystem..."
+        sudo mount -t cgroup2 cgroup2 /sys/fs/cgroup || error_exit "Failed to mount cgroup v2 filesystem"
+    fi
+
+    # Ensure proper permissions on the cgroup mountpoint
+    sudo chmod 755 /sys/fs/cgroup
+    sudo chown root:root /sys/fs/cgroup
+
+    # Create container-specific cgroup directory
+    CONTAINER_CGROUP="/sys/fs/cgroup/container-${IMAGE_ID}"
+    sudo mkdir -p "$CONTAINER_CGROUP"
+    sudo chown -R root:root "$CONTAINER_CGROUP"
+    sudo chmod -R 755 "$CONTAINER_CGROUP"
+
+    # Modify config.json cgroupsPath if the file exists
+    local config_file="$BUNDLE_DIR/config.json"
+    if [ -f "$config_file" ]; then
+        sed -i "s|\"cgroupsPath\": \"/sys/fs/cgroup\"|\"cgroupsPath\": \"$CONTAINER_CGROUP\"|g" "$config_file"
+    fi
+
+    # Verify that the mount is in place
+    if ! mountpoint -q /sys/fs/cgroup; then
+        error_exit "Failed to mount cgroup v2 filesystem"
+    fi
+
+    log "Cgroup v2 filesystem prepared successfully"
+}
+# END: prepare_cgroup_filesystem function
+
+# -----------------------------------------------------------------------------
+# BEGIN: cleanup_cgroups function
+# Function to clean up container-specific cgroups.
+cleanup_cgroups() {
+    log "Cleaning up container-specific cgroups..."
+
+    # Remove container-specific cgroup directory if it exists
+    if [ -d "$CONTAINER_CGROUP" ]; then
+        sudo rmdir "$CONTAINER_CGROUP" 2>/dev/null || true
+    fi
+
+    # Kill any processes that remain in the container-specific cgroup
+    local cgroup_procs="/sys/fs/cgroup/container-${IMAGE_ID}/cgroup.procs"
+    if [ -f "$cgroup_procs" ]; then
+        while read -r pid; do
+            sudo kill -9 "$pid" 2>/dev/null || true
+        done < "$cgroup_procs"
     fi
 }
-#End of trap
-# Function to create necessary directories with proper permissions
+# END: cleanup_cgroups function
+
+# -----------------------------------------------------------------------------
+# BEGIN: cleanup_legacy_cgroups function
+# Function to clean up any legacy cgroup v1 directories that might have been created.
+cleanup_legacy_cgroups() {
+    log "Cleaning up legacy cgroup v1 directories..."
+    # List of common legacy cgroup v1 controllers
+    local controllers=(cpuset cpu cpuacct memory devices freezer net_cls blkio)
+    for subsys in "${controllers[@]}"; do
+        if mountpoint -q "/sys/fs/cgroup/$subsys"; then
+            log "Unmounting legacy cgroup v1 controller: $subsys..."
+            sudo umount "/sys/fs/cgroup/$subsys" 2>/dev/null || true
+        fi
+        if [ -d "/sys/fs/cgroup/$subsys" ]; then
+            log "Removing legacy cgroup directory: /sys/fs/cgroup/$subsys..."
+            sudo rmdir "/sys/fs/cgroup/$subsys" 2>/dev/null || true
+        fi
+    done
+}
+# END: cleanup_legacy_cgroups function
+
+# -----------------------------------------------------------------------------
+# BEGIN: cleanup function
+# Modified cleanup function that calls cleanup_cgroups, cleanup_legacy_cgroups, and performs additional cleanup.
+cleanup() {
+    local exit_code=$?
+    log "Performing cleanup..."
+
+    cleanup_cgroups           # Clean up container-specific cgroup resources
+    cleanup_legacy_cgroups    # Clean up any legacy cgroup v1 directories
+
+    # Stop and remove container if it exists.
+    if sudo crun list | grep -qw "$IMAGE_ID"; then
+        sudo crun stop "$IMAGE_ID" 2>/dev/null || true
+        sudo crun delete -f "$IMAGE_ID" 2>/dev/null || true
+    fi
+
+    # Delete network namespace if it exists.
+    if sudo ip netns list | grep -qw "$NETNS_NAME"; then
+        sudo ip netns del "$NETNS_NAME" 2>/dev/null || true
+    fi
+
+    # Delete veth pair if it exists.
+    if ip link show veth1 &>/dev/null; then
+        sudo ip link delete veth1 2>/dev/null || true
+    fi
+
+    # Remove bundle and downloads directories.
+    sudo rm -rf "$DOWNLOAD_DIR" "$BUNDLE_DIR"
+    rm -f "/tmp/container_$IMAGE_ID.pid"
+
+    exit "$exit_code"
+}
+# END: cleanup function
+
+# -----------------------------------------------------------------------------
+# BEGIN: check_dependencies function
+# Function to check required dependencies.
+check_dependencies() {
+    local deps=(crun sudo wget mount gpg sha256sum tar unzstd)
+    for cmd in "${deps[@]}"; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            error_exit "$cmd is not installed. Please install it before running this script."
+        fi
+    done
+
+    # Check that crun's version is at least 1.0
+    local crun_version
+    crun_version=$(crun --version | head -n1 | awk '{print $3}')
+    if ! printf '%s\n%s\n' "1.0" "$crun_version" | sort -V -C; then
+        error_exit "crun version must be at least 1.0"
+    fi
+}
+# END: check_dependencies function
+
+# -----------------------------------------------------------------------------
+# BEGIN: create_directories function
+# Function to create necessary directories with proper permissions.
 create_directories() {
     log "Creating necessary directories..."
 
-    # Create directories
     sudo mkdir -p "$DOWNLOAD_DIR" "$BUNDLE_DIR/rootfs" "$HOST_CONFIG_DIR" "$HOST_MEDIA_DIR"
 
     # Change ownership to the current user
@@ -118,32 +257,29 @@ create_directories() {
 
     log "Directories created and permissions verified."
 }
-# End of Function to create necessary directories with proper permissions
-# Function to download and verify image
+# END: create_directories function
+
+# -----------------------------------------------------------------------------
+# BEGIN: download_verify_image function
+# Function to download and verify the Arch Linux bootstrap image.
 download_verify_image() {
-    # Ensure the download directory exists
     mkdir -p "$DOWNLOAD_DIR"
 
-    # Download the Arch Linux bootstrap tarball
     log "Downloading Arch Linux bootstrap tarball..."
     wget -O "$DOWNLOAD_DIR/$IMAGE_FILE" "$IMAGE_URL_ARCH" || error_exit "Failed to download $IMAGE_URL_ARCH"
 
-    # Download the signature file
     log "Downloading signature file..."
     wget -O "$DOWNLOAD_DIR/$(basename "$IMAGE_FILE").sig" "$IMAGE_SIG_URL" || error_exit "Failed to download $IMAGE_SIG_URL"
 
-    # Download the checksum file
     log "Downloading sha256sums.txt..."
     wget -O "$DOWNLOAD_DIR/sha256sums.txt" "$CHECKSUMS_URL" || error_exit "Failed to download $CHECKSUMS_URL"
 
     # Extract the expected SHA256 checksum from the checksum file.
-    # The expected checksum is assumed to be the first field on the line containing the tarball's filename.
     EXPECTED_CHECKSUM=$(grep "$(basename "$IMAGE_FILE")" "$DOWNLOAD_DIR/sha256sums.txt" | awk '{print $1}')
     if [ -z "$EXPECTED_CHECKSUM" ]; then
         error_exit "Could not find expected SHA256 checksum for $IMAGE_FILE in sha256sums.txt."
     fi
 
-    # Calculate the actual SHA256 checksum of the downloaded tarball
     ACTUAL_CHECKSUM=$(sha256sum "$DOWNLOAD_DIR/$IMAGE_FILE" | awk '{print $1}')
     if [ "$EXPECTED_CHECKSUM" != "$ACTUAL_CHECKSUM" ]; then
         error_exit "Checksum mismatch: expected $EXPECTED_CHECKSUM but got $ACTUAL_CHECKSUM."
@@ -151,42 +287,23 @@ download_verify_image() {
 
     log "Checksum verified successfully."
 
-    # Verify the signature using GnuPG (keys are assumed already imported)
     log "Verifying the signature of the bootstrap tarball using GnuPG..."
     gpg --verify "$DOWNLOAD_DIR/$(basename "$IMAGE_FILE").sig" "$DOWNLOAD_DIR/$IMAGE_FILE" || error_exit "GPG signature verification failed."
 
-    # Create the bundle's rootfs directory (where the tarball will be extracted)
     mkdir -p "$BUNDLE_DIR/rootfs"
 
-    # Extract the tarball into the container's rootfs directory using unzstd for Zstandard compression
     log "Extracting Arch Linux bootstrap tarball into rootfs..."
     tar --use-compress-program=unzstd -xpf "$DOWNLOAD_DIR/$IMAGE_FILE" -C "$BUNDLE_DIR/rootfs" --strip-components=1 || error_exit "Extraction failed."
 
     log "Arch Linux bootstrap rootfs is ready."
 }
-# End of the Function to download and verify image
-# Function to check dependencies
-check_dependencies() {
-    local deps=(crun sudo wget mount)  # Using wget as per the script, mount is included for cgroup operations
-    for cmd in "${deps[@]}"; do
-        if ! command -v "$cmd" >/dev/null 2>&1; then
-            error_exit "$cmd is not installed. Please install it before running this script."  # Check if all dependencies are installed
-        fi
-    done
+# END: download_verify_image function
 
-    # Check crun version
-    local crun_version
-    crun_version=$(crun --version | head -n1 | awk '{print $3}')  # Get crun version
-    if ! printf '%s\n%s\n' "1.0" "$crun_version" | sort -V -C; then  # Check if crun version is at least 1.0
-        error_exit "crun version must be at least 1.0"  # Exit if version is not valid
-    fi
-}
-
-
-#End of download and create function
-# Function to create Nginx config
+# -----------------------------------------------------------------------------
+# BEGIN: create_nginx_config function
+# Function to create a default Nginx configuration.
 create_nginx_config() {
-    if [ ! -f "$HOST_NGINX_CONF" ]; then  # Check if the Nginx config file does not exist
+    if [ ! -f "$HOST_NGINX_CONF" ]; then
         log "Creating default Nginx config..."
         cat <<EOF > "$HOST_NGINX_CONF"
 user nginx;
@@ -218,25 +335,26 @@ http {
         location / {
             root /usr/share/nginx/html;
             index index.html index.htm;
-            autoindex on;  # Enable directory listing for serving static media
+            autoindex on;
         }
 
-        # Security headers
         add_header X-Frame-Options "SAMEORIGIN";
         add_header X-Content-Type-Options "nosniff";
         add_header X-XSS-Protection "1; mode=block";
     }
 }
 EOF
-        sudo chmod 644 "$HOST_NGINX_CONF"  # Set permissions for Nginx config file
+        sudo chmod 644 "$HOST_NGINX_CONF"
         log "Nginx config created."
     else
         log "Nginx config already exists at $HOST_NGINX_CONF."
     fi
 }
-#End of crete nginx config function
-# Function to create container config
-# Function to create container config
+# END: create_nginx_config function
+
+# -----------------------------------------------------------------------------
+# BEGIN: create_container_config function
+# Function to create the container configuration (config.json).
 create_container_config() {
     if [ ! -d "$BUNDLE_DIR" ]; then
         log "Error: Directory $BUNDLE_DIR does not exist."
@@ -306,9 +424,11 @@ EOF
     sudo chmod 644 "$BUNDLE_DIR/config.json"
     log "Container config created."
 }
-#End of create container config function
-#End of create container config function
-#Function to create namesapces networking
+# END: create_container_config function
+
+# -----------------------------------------------------------------------------
+# BEGIN: setup_networking function
+# Function to set up networking (network namespace and veth pair).
 setup_networking() {
     log "Setting up network..."
 
@@ -318,114 +438,65 @@ setup_networking() {
         sudo ip netns add "$NETNS_NAME"
     fi
 
-    # Create veth pair if they don't exist
+    # Create veth pair if it doesn't exist
     if ! ip link show veth1 &>/dev/null; then
         log "Creating veth pair..."
         sudo ip link add veth0 type veth peer name veth1
         sudo ip link set veth0 netns "$NETNS_NAME"
         sudo ip link set veth1 master "$BRIDGE_NAME"
-        sudo ip link set veth1 up  # Bring up the host side of veth pair
+        sudo ip link set veth1 up
     fi
-    
-    sudo ip netns exec "$NETNS_NAME" ip addr add "$CONTAINER_IP" dev veth0  # Assign IP to container's veth interface
-    sudo ip netns exec "$NETNS_NAME" ip link set veth0 up  # Bring up container's veth interface
-}
-#End of the function to create namesapces networking
-# Function to check dependencies
-check_dependencies() {
-    local deps=(crun sudo wget mount)  # Added mount to the list of dependencies
-    for cmd in "${deps[@]}"; do
-        if ! command -v "$cmd" >/dev/null 2>&1; then
-            error_exit "$cmd is not installed. Please install it before running this script."  # Check if all dependencies are installed
-        fi
-    done
 
-    # Check crun version
-    local crun_version
-    crun_version=$(crun --version | head -n1 | awk '{print $3}')  # Get crun version
-    if ! printf '%s\n%s\n' "1.0" "$crun_version" | sort -V -C; then  # Check if crun version is at least 1.0
-        error_exit "crun version must be at least 1.0"  # Exit if version is not valid
-    fi
+    sudo ip netns exec "$NETNS_NAME" ip addr add "$CONTAINER_IP" dev veth0
+    sudo ip netns exec "$NETNS_NAME" ip link set veth0 up
 }
+# END: setup_networking function
 
-# Function to check cgroup version
+# -----------------------------------------------------------------------------
+# BEGIN: check_cgroup_version function
+# Function to check and display the current cgroup version and structure.
 check_cgroup_version() {
     log "Checking cgroup version..."
-    if [[ -f /proc/cgroups ]]; then
-        if grep -q '1' /proc/cgroups; then
-            log "System is using cgroup v1."
-        else
-            log "System appears to be using cgroup v2."
-        fi
+    if [[ -f /proc/filesystems ]] && grep -q cgroup2 /proc/filesystems; then
+        log "System is using cgroup v2."
     else
-        log "Unable to determine cgroup version from /proc/cgroups. Assuming cgroup v2."
+        log "cgroup v2 not found; please verify your system configuration."
     fi
     log "Current cgroup structure:"
     ls -l /sys/fs/cgroup
 }
+# END: check_cgroup_version function
 
-# Function to prepare cgroup v2 environment
-prepare_cgroup_v2() {
-    log "Preparing cgroup v2 environment..."
-    if ! mount | grep -q "/sys/fs/cgroup cgroup2"; then
-        log "Mounting unified cgroup2 filesystem..."
-        if sudo mount -t cgroup2 none /sys/fs/cgroup; then
-            log "Successfully mounted cgroup2."
-            # Set correct permissions for cgroup2 directory
-            sudo chmod 755 /sys/fs/cgroup
-            # Ensure root has ownership
-            sudo chown root:root /sys/fs/cgroup
-            # Optionally, you might want to set specific permissions for subdirectories
-            sudo find /sys/fs/cgroup -type d -exec sudo chmod 755 {} \;
-            log "Permissions set for cgroup2."
-        else
-            error_exit "Failed to mount cgroup2. Check if cgroup2 support is enabled in your kernel."
-        fi
-    else
-        log "cgroup2 is already mounted."
-        # Check and set permissions if they are not correct
-        if [ "$(stat -c %a /sys/fs/cgroup)" != "755" ] || [ "$(stat -c %U:%G /sys/fs/cgroup)" != "root:root" ]; then
-            sudo chmod 755 /sys/fs/cgroup
-            sudo chown root:root /sys/fs/cgroup
-            sudo find /sys/fs/cgroup -type d -exec sudo chmod 755 {} \;
-            log "Permissions adjusted for existing cgroup2 mount."
-        else
-            log "Permissions for cgroup2 are already correct."
-        fi
-    fi
-    log "Cgroup v2 preparation completed."
-}
-
-# Function to verify cgroup setup
-verify_cgroup() {
-    log "Verifying cgroup setup..."
-    ls -l /sys/fs/cgroup
-    log "Verification completed."
-}
-# End of Function to verify cgroup setup
-# Function to start the container
+# -----------------------------------------------------------------------------
+# BEGIN: start_container function
+# Function to start the container.
 start_container() {
     log "Starting container $IMAGE_ID..."
     sudo ip netns exec "$NETNS_NAME" crun run -b "$BUNDLE_DIR" "$IMAGE_ID" &
     local pid=$!
-    echo "$pid" > "$BASE_DIR/container_$IMAGE_ID.pid"  # Write the PID to a file
+    echo "$pid" > "/tmp/container_$IMAGE_ID.pid"
 }
-# End of Function to start the container
-# Main function
+# END: start_container function
+
+# -----------------------------------------------------------------------------
+# BEGIN: main function
+# Main function to orchestrate the container setup.
 main() {
-    check_dependencies      # Check for required dependencies
-    create_directories      # Create necessary directories
-    download_verify_image   # Download and verify the Arch Linux image
-    create_nginx_config     # Create Nginx configuration
-    create_container_config # Create container configuration
-    setup_networking        # Set up networking for the container
-    check_cgroup_version    # Check cgroup version
-    prepare_cgroup_v2       # Prepare cgroup v2 environment
-    verify_cgroup           # Verify cgroup setup
-    start_container         # Start the container
+    pre_cleanup               # Clean up leftovers from previous runs
+    check_dependencies        # Check for required dependencies
+    create_directories        # Create necessary directories
+    download_verify_image     # Download and verify the Arch Linux image
+    create_nginx_config       # Create Nginx configuration
+    create_container_config   # Create container configuration
+    setup_networking          # Set up networking for the container
+    check_cgroup_version      # Check the current cgroup version
+    prepare_cgroup_filesystem # Prepare the cgroup v2 filesystem and update config.json
+    start_container           # Start the container
 
     log "Container started with port forwarding from host $HOST_PORT to container $CONTAINER_PORT."
 }
+# END: main function
 
-# Invoke the main function
+# -----------------------------------------------------------------------------
+# Invoke the main function with any provided arguments.
 main "$@"
