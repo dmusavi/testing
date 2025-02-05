@@ -31,7 +31,6 @@ BUNDLE_DIR="$BASE_DIR"
 
 # -----------------------------------------------------------------------------
 # BEGIN: log function
-# Function to log informational messages.
 log() {
     echo "[INFO] $1"
 }
@@ -39,7 +38,6 @@ log() {
 
 # -----------------------------------------------------------------------------
 # BEGIN: error_exit function
-# Function to handle errors by printing a message and exiting.
 error_exit() {
     echo "[ERROR] $1" >&2
     exit 1
@@ -48,7 +46,6 @@ error_exit() {
 
 # -----------------------------------------------------------------------------
 # BEGIN: precleanup function
-# New function to perform a complete cleanup of legacy cgroup v1 resources.
 precleanup() {
     log "Performing complete cleanup of cgroup v1 resources..."
 
@@ -84,7 +81,6 @@ precleanup() {
 
 # -----------------------------------------------------------------------------
 # BEGIN: setup_cgroup_v2 function
-# New function to set up cgroup v2 with delegation to the current user.
 setup_cgroup_v2() {
     log "Setting up cgroup v2 with delegation to $USER..."
 
@@ -121,10 +117,15 @@ setup_cgroup_v2() {
 
 # -----------------------------------------------------------------------------
 # BEGIN: cleanup function
-# Modified cleanup function that performs additional cleanup.
 cleanup() {
     local exit_code=$?
     log "Performing cleanup..."
+
+    # Remove user's cgroup directory if it exists
+    USER_CGROUP="/sys/fs/cgroup/$USER"
+    if [ -d "$USER_CGROUP" ]; then
+        sudo rmdir "$USER_CGROUP" 2>/dev/null || true
+    fi
 
     # Existing cleanup code:
     if sudo crun list | grep -qw "$IMAGE_ID"; then
@@ -149,7 +150,6 @@ cleanup() {
 
 # -----------------------------------------------------------------------------
 # BEGIN: check_dependencies function
-# Function to check required dependencies.
 check_dependencies() {
     local deps=(crun sudo wget mount gpg sha256sum tar unzstd)
     for cmd in "${deps[@]}"; do
@@ -169,7 +169,6 @@ check_dependencies() {
 
 # -----------------------------------------------------------------------------
 # BEGIN: create_directories function
-# Function to create necessary directories with proper permissions.
 create_directories() {
     log "Creating necessary directories..."
 
@@ -195,7 +194,6 @@ create_directories() {
 
 # -----------------------------------------------------------------------------
 # BEGIN: download_verify_image function
-# Function to download and verify the Arch Linux bootstrap image.
 download_verify_image() {
     mkdir -p "$DOWNLOAD_DIR"
 
@@ -235,7 +233,6 @@ download_verify_image() {
 
 # -----------------------------------------------------------------------------
 # BEGIN: create_nginx_config function
-# Function to create a default Nginx configuration.
 create_nginx_config() {
     if [ ! -f "$HOST_NGINX_CONF" ]; then
         log "Creating default Nginx config..."
@@ -288,7 +285,6 @@ EOF
 
 # -----------------------------------------------------------------------------
 # BEGIN: create_container_config function
-# Function to create the container configuration (config.json).
 create_container_config() {
     if [ ! -d "$BUNDLE_DIR" ]; then
         log "Error: Directory $BUNDLE_DIR does not exist."
@@ -326,7 +322,7 @@ create_container_config() {
             "memory": {"limit": 512000000},
             "cpu": {"weight": 1024}
         },
-        "cgroupsPath": "/delegated",
+        "cgroupsPath": "/$USER",
         "seccomp": {
             "defaultAction": "SCMP_ACT_ERRNO",
             "architectures": ["SCMP_ARCH_X86_64"],
@@ -349,8 +345,8 @@ create_container_config() {
         {"destination": "/dev", "type": "tmpfs", "source": "tmpfs", "options": ["nosuid", "strictatime", "mode=755", "size=65536k"]},
         {"destination": "/dev/pts", "type": "devpts", "source": "devpts", "options": ["nosuid", "noexec", "newinstance", "ptmxmode=0666", "mode=0620"]},
         {"destination": "/sys", "type": "sysfs", "source": "sysfs", "options": ["nosuid", "noexec", "nodev", "ro"]},
-        {"destination": "/etc/nginx/nginx.conf", "source": "'"$HOST_NGINX_CONF"'", "type": "bind", "options": ["ro", "rbind"]},
-        {"destination": "/usr/share/nginx/html", "source": "'"$HOST_MEDIA_DIR"'", "type": "bind", "options": ["ro", "rbind"]}
+        {"destination": "/etc/nginx/nginx.conf", "source": "$HOST_NGINX_CONF", "type": "bind", "options": ["ro", "rbind"]},
+        {"destination": "/usr/share/nginx/html", "source": "$HOST_MEDIA_DIR", "type": "bind", "options": ["ro", "rbind"]}
     ]
 }
 EOF
@@ -362,7 +358,6 @@ EOF
 
 # -----------------------------------------------------------------------------
 # BEGIN: setup_networking function
-# Function to set up networking (network namespace and veth pair).
 setup_networking() {
     log "Setting up network..."
 
@@ -387,8 +382,21 @@ setup_networking() {
 # END: setup_networking function
 
 # -----------------------------------------------------------------------------
+# BEGIN: check_cgroup_version function
+check_cgroup_version() {
+    log "Checking cgroup version..."
+    if [[ -f /proc/filesystems ]] && grep -q cgroup2 /proc/filesystems; then
+        log "System is using cgroup v2."
+    else
+        log "cgroup v2 not found; please verify your system configuration."
+    fi
+    log "Current cgroup structure:"
+    ls -l /sys/fs/cgroup
+}
+# END: check_cgroup_version function
+
+# -----------------------------------------------------------------------------
 # BEGIN: start_container function
-# Function to start the container.
 start_container() {
     log "Starting container $IMAGE_ID..."
     sudo ip netns exec "$NETNS_NAME" crun run -b "$BUNDLE_DIR" "$IMAGE_ID" &
@@ -399,25 +407,22 @@ start_container() {
 
 # -----------------------------------------------------------------------------
 # BEGIN: main function
-# Main function to orchestrate the container setup.
 main() {
-    precleanup                 # Clean up legacy cgroup v1 resources
+    precleanup                 # Clean up cgroup v1 resources
+    setup_cgroup_v2            # Setup cgroup v2 with user delegation
     check_dependencies          # Check for required dependencies
     create_directories          # Create necessary directories
     download_verify_image       # Download and verify the Arch Linux image
     create_nginx_config         # Create Nginx configuration
     create_container_config     # Create container configuration
     setup_networking            # Set up networking for the container
-    setup_cgroup_v2             # Set up cgroup v2 with delegation to the user
+    check_cgroup_version        # Check the current cgroup version
     start_container             # Start the container
 
-    log "Container started with port forwarding from host port $HOST_PORT to container port $CONTAINER_PORT."
+    log "Container started with port forwarding from host $HOST_PORT to container $CONTAINER_PORT."
 }
+# END: main function
 
 # -----------------------------------------------------------------------------
-# Trap to ensure cleanup is performed on exit
 trap cleanup EXIT
-
-# -----------------------------------------------------------------------------
-# Execute main function
-main
+main "$@"
